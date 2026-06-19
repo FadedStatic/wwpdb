@@ -169,7 +169,6 @@ namespace wwpdb {
 
     inline nlohmann::json parse(const std::wstring_view file_hash, const std::wstring_view base_url = L"msdl.microsoft.com") {
         const auto data = util::download(base_url, file_hash);
-        std::printf("Downloaded %llu bytes\r\n", data.size());
         return data.empty() ? nlohmann::json{} : parse(data);
     }
 #endif
