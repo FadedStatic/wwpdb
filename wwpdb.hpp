@@ -1,5 +1,5 @@
 #pragma once
-#include "nlohmann/json.hpp" // even if it's a lib dir, quotes still work
+#include "nlohmann/json.hpp"
 #define WWPDB_DOWNLOAD // comment this out if you do not wish to include downloading
 
 #ifdef WWPDB_DOWNLOAD
@@ -25,32 +25,48 @@ struct dbi_header {
 };
 
 struct section_contrib {
-    uint16_t section{}, pad_0{};
-    int32_t  offset{},size{};
-    uint32_t characteristics{};
-    uint16_t module_idx{}, pad_1{};
-    uint32_t data_crc{}, reloc_crc{};
+    std::uint16_t section{}, pad_0{};
+    int32_t offset{}, size{};
+    std::uint32_t characteristics{};
+    std::uint16_t module_idx{}, pad_1{};
+    std::uint32_t data_crc{}, reloc_crc{};
 };
 
 struct mod_info {
-    uint32_t pad_0{};
+    std::uint32_t pad_0{};
     section_contrib section_contrib{};
-    uint16_t flags{}, sym_stream{};
-    uint32_t sym_bytes{}, c11_bytes{}, c13_bytes{};
-    uint16_t src_file_count{}, pad{};
-    uint32_t pad_2{}, src_file_name_idx{}, pdb_file_path_idx{};
+    std::uint16_t flags{}, sym_stream{};
+    std::uint32_t sym_bytes{}, c11_bytes{}, c13_bytes{};
+    std::uint16_t src_file_count{}, pad{};
+    std::uint32_t pad_2{}, src_file_name_idx{}, pdb_file_path_idx{};
     // mod_name and obj_name follow (both null terminated)
 };
 
 struct sym_record {
-    uint16_t len{}, kind{};
+    std::uint16_t len{}, kind{};
 };
 
 struct sym_proc {
-    uint32_t p_parent{},p_end{},p_next{},proc_len{},dbg_start{},dbg_end{},type_idx{},offset{};
-    uint16_t segment{};
-    uint8_t  flags{};
-    // symbol name at end of this.
+    std::uint32_t p_parent{}, p_end{}, p_next{}, proc_len{}, dbg_start{}, dbg_end{}, type_idx{}, offset{};
+    std::uint16_t segment{};
+    std::uint8_t flags{};
+    // symbol name follows
+};
+
+// S_PUB32 (0x110E), different layout
+struct sym_pub {
+    std::uint32_t flags{};
+    std::uint32_t offset{};
+    std::uint16_t segment{};
+    // symbol name follows
+};
+
+// man the PDB format is really amazing sometimes, this is just image_section_header.
+struct pe_section {
+    char name[8]{};
+    std::uint32_t virtual_size{}, virtual_address{}, raw_size{}, raw_offset{}, reloc_offset{}, line_offset{};
+    std::uint16_t reloc_count{}, line_count{};
+    std::uint32_t characteristics{};
 };
 #pragma pack(pop)
 
@@ -62,9 +78,9 @@ namespace wwpdb {
 
         const auto& sb = *reinterpret_cast<const msf_superblock*>(pdb_base);
         const auto block_sz = sb.block_sz;
-        const auto cdiv = [&](const uint32_t a) { return (a + block_sz - 1) / block_sz; };
+        const auto cdiv = [&](const std::uint32_t a) { return (a + block_sz - 1) / block_sz; };
 
-        const auto read_blocks = [&](const uint32_t* blocks, uint32_t byte_len) {
+        const auto read_blocks = [&](const std::uint32_t* blocks, std::uint32_t byte_len) {
             std::vector<uint8_t> out;
             out.reserve(byte_len);
 
@@ -77,16 +93,17 @@ namespace wwpdb {
         };
 
         const auto dir = read_blocks(
-            reinterpret_cast<const uint32_t*>(pdb_base + sb.block_map_addr * block_sz),
+            reinterpret_cast<const std::uint32_t*>(pdb_base + sb.block_map_addr * block_sz),
             sb.num_dir_bytes
         );
 
-        const auto get_stream = [&](const uint32_t idx) -> std::vector<uint8_t> {
-            const auto stream_ct = *reinterpret_cast<const uint32_t*>(dir.data());
-            const auto* stream_sizes =  reinterpret_cast<const uint32_t*>(dir.data() + 4);
-            const auto stream_sz  = stream_sizes[idx];
+        const auto get_stream = [&](const std::uint32_t idx) -> std::vector<uint8_t> {
+            const auto stream_ct = *reinterpret_cast<const std::uint32_t*>(dir.data());
+            const auto* stream_sizes = reinterpret_cast<const std::uint32_t*>(dir.data() + 4);
 
-            if (idx >= stream_ct || !stream_sz || stream_sz == ~0u) return {};
+            if (idx >= stream_ct) return {};
+            const auto stream_sz = stream_sizes[idx];
+            if (!stream_sz || stream_sz == ~0u) return {};
 
             const auto* stream_blocks = stream_sizes + stream_ct;
             for (uint32_t i = 0; i < idx; ++i)
@@ -100,38 +117,157 @@ namespace wwpdb {
         const auto& dbi = *reinterpret_cast<const dbi_header*>(dbi_data.data());
         if (dbi.version_sig != -1) return {};
 
+        // DBI debug header sits after the four DBI substreams per llvm / msvc docs.
+        // idx 10 has the section table which is of use to us.
+        std::vector<uint32_t> sect_vas;
+
+        {
+            const auto dbg_hdr_off = sizeof(dbi_header)
+                + static_cast<size_t>(dbi.mod_info_sz)
+                + static_cast<size_t>(dbi.section_contrib_sz)
+                + static_cast<size_t>(dbi.section_map_sz)
+                + static_cast<size_t>(dbi.source_info_sz)
+                + static_cast<size_t>(dbi.type_server_map_sz)
+                + static_cast<size_t>(dbi.ec_substream_sz);
+
+            constexpr int k_sect_hdr_idx = 5;
+            const auto dbg_hdr_bytes = static_cast<size_t>(dbi.optional_dbg_header_sz);
+
+            if (constexpr auto needed = (k_sect_hdr_idx + 1) * sizeof(int16_t);
+                    dbg_hdr_off + dbg_hdr_bytes <= dbi_data.size() && dbg_hdr_bytes >= needed) {
+                const auto* dbg = reinterpret_cast<const int16_t*>(dbi_data.data() + dbg_hdr_off);
+
+                if (const auto sect_stream_idx = static_cast<uint32_t>(dbg[k_sect_hdr_idx]); sect_stream_idx != 0xFFFF) {
+                    const auto sect_data = get_stream(sect_stream_idx);
+                    const auto n_sects = sect_data.size() / sizeof(pe_section);
+                    const auto* sects = reinterpret_cast<const pe_section*>(sect_data.data());
+
+                    sect_vas.reserve(n_sects);
+                    for (size_t i = 0; i < n_sects; ++i)
+                        sect_vas.push_back(sects[i].virtual_address);
+                }
+            }
+        }
+
+        const auto to_rva = [&](const std::uint16_t seg, const std::uint32_t off) -> std::uint32_t {
+            if (seg == 0 || seg > sect_vas.size()) return off;
+            return sect_vas[seg - 1] + off;
+        };
+
         nlohmann::json funcs = nlohmann::json::array();
+
+        const auto scan_sym_stream = [&](const std::vector<uint8_t>& sym) {
+            if (sym.size() < 4) return;
+
+            const std::uint32_t first_dword = *reinterpret_cast<const std::uint32_t*>(sym.data());
+            const auto* p = sym.data() + (first_dword == 4u ? 4u : 0u);
+            const auto* e = sym.data() + sym.size();
+
+            while (p + sizeof(sym_record) <= e) {
+                const auto* rec = reinterpret_cast<const sym_record*>(p);
+                if (rec->len < sizeof(uint16_t)) break;
+
+                // aligninize this for real
+                const auto* next = p + (sizeof(uint16_t) + rec->len + 3u & ~3u);
+                if (next > e) break;
+
+                const auto* payload = p + sizeof(sym_record);
+
+                switch (rec->kind) {
+                    case 0x110F: // S_LPROC32
+                    case 0x1110: // S_GPROC32
+                    case 0x1125: // S_LPROC32_DPC
+                    case 0x1126: // S_LPROC32_DPC_ID
+                    case 0x1146: // S_LPROC32_ID
+                    case 0x1147: { // S_GPROC32_ID
+                        const auto& proc = *reinterpret_cast<const sym_proc*>(payload);
+                        funcs.push_back({
+                            {"name", reinterpret_cast<const char*>(&proc + 1)},
+                            {"rva", to_rva(proc.segment, proc.offset)},
+                            {"segment", proc.segment},
+                        });
+                        break;
+                    }
+                    case 0x110E: { // S_PUB32, this one just has to be special man yeah woohooo who even cares about the convention am i right
+                        const auto& pub = *reinterpret_cast<const sym_pub*>(payload);
+                        funcs.push_back({
+                            {"name", reinterpret_cast<const char*>(&pub + 1)},
+                            {"rva", to_rva(pub.segment, pub.offset)},
+                            {"segment", pub.segment},
+                        });
+                        break;
+                    }
+                    default: break;
+                }
+
+                p = next;
+            }
+        };
 
         const auto* mod_ptr = dbi_data.data() + sizeof(dbi_header);
         const auto* mod_end = mod_ptr + dbi.mod_info_sz;
 
         while (mod_ptr + sizeof(mod_info) <= mod_end) {
-            if (const auto& mod = *reinterpret_cast<const mod_info*>(mod_ptr); mod.sym_stream != 0xFFFF) {
-                const auto sym = get_stream(mod.sym_stream);
-                const auto* p = sym.data() + 4;
-                const auto* e = sym.data() + sym.size();
+            const auto& mod = *reinterpret_cast<const mod_info*>(mod_ptr);
 
-                while (p + sizeof(sym_record) <= e) {
-                    const auto* rec  = reinterpret_cast<const sym_record*>(p);
-                    const auto* next = p + sizeof(uint16_t) + rec->len;
-                    if (next > e) break;
-
-                    if (rec->kind == 0x110F || rec->kind == 0x1110 || rec->kind == 0x1146 || rec->kind == 0x1147) {
-                        const auto& proc = *reinterpret_cast<const sym_proc*>(p + sizeof(sym_record));
-                        funcs.push_back({
-                            {"name", reinterpret_cast<const char*>(&proc + 1)},
-                            {"rva", proc.offset},
-                            {"segment", proc.segment},
-                        });
-                    }
-                    p = next;
-                }
-            }
+            if (mod.sym_stream != 0xFFFF)
+                scan_sym_stream(get_stream(mod.sym_stream));
 
             const auto* n = reinterpret_cast<const char*>(mod_ptr + sizeof(mod_info));
             const auto* o = n + strlen(n) + 1;
             mod_ptr += (sizeof(mod_info) + strlen(n) + 1 + strlen(o) + 1 + 3) & ~3u;
         }
+
+        {
+            struct publics_header { // honestly if it were between publix and lidl I'd pick lidl every time
+                std::uint32_t sym_hash_sz{},addr_map_sz{}, num_thunks{}, thunk_size{};
+                std::uint16_t thunk_table_sec{},pad{};
+                std::uint32_t thunk_table_off{},sect_count{};
+            };
+
+            const auto pub_data = get_stream(dbi.public_stream_idx);
+            const auto sym_data = get_stream(dbi.sym_record_stream);
+
+            if (pub_data.size() >= sizeof(publics_header) && !sym_data.empty()) {
+                const auto& ph = *reinterpret_cast<const publics_header*>(pub_data.data());
+
+                const auto addr_map_off = sizeof(publics_header) + ph.sym_hash_sz;
+                const auto addr_map_cnt = ph.addr_map_sz / sizeof(uint32_t);
+
+                if (addr_map_off + ph.addr_map_sz <= pub_data.size()) {
+                    const auto* addr_map = reinterpret_cast<const std::uint32_t*>(pub_data.data() + addr_map_off);
+
+                    for (uint32_t i = 0; i < addr_map_cnt; ++i) {
+                        const std::uint32_t off = addr_map[i];
+                        if (off + sizeof(sym_record) > sym_data.size()) continue;
+
+                        const auto* rec = reinterpret_cast<const sym_record*>(sym_data.data() + off);
+                        if (rec->kind != 0x110E) continue; // only S_PUB32
+
+                        const auto* payload = reinterpret_cast<const std::uint8_t*>(rec + 1);
+                        if (off + sizeof(sym_record) + sizeof(sym_pub) > sym_data.size()) continue;
+
+                        const auto& pub = *reinterpret_cast<const sym_pub*>(payload);
+                        funcs.push_back({
+                            {"name", reinterpret_cast<const char*>(&pub + 1)},
+                            {"rva", to_rva(pub.segment, pub.offset)},
+                            {"segment", pub.segment},
+                        });
+                    }
+                }
+            }
+        }
+
+        std::sort(funcs.begin(), funcs.end(), [](const auto& a, const auto& b) {
+            if (a["segment"] != b["segment"]) return a["segment"] < b["segment"];
+            return a["rva"] < b["rva"];
+        });
+        funcs.erase(
+            std::ranges::unique(funcs, [](const auto& a, const auto& b) {
+                return a["segment"] == b["segment"] && a["rva"] == b["rva"];
+            }).begin(),
+            funcs.end()
+        );
 
         return funcs;
     }
